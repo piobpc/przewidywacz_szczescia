@@ -1,0 +1,9 @@
+.env
+logs.log
+whr_report.html
+whr_prediction_model_v1
+whr_prediction_model_v2
+whr_prediction_model_final
+whr_prediction_model_v1.pkl
+whr_prediction_model_v2.pkl
+whr_prediction_model_final.pkl
