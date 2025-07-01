@@ -6,4 +6,4 @@ botocore
 openai
 pycaret
 requests
-langfuse
+langfuse==2.51.4
