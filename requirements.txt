@@ -6,3 +6,4 @@ botocore
 openai
 pycaret
 requests
+langfuse

@@ -13,9 +13,7 @@ from pycaret.regression import load_model, predict_model
 import requests, textwrap
 from typing import Optional
 from langfuse import Langfuse
-from langfuse.decorators import observe
 from langfuse.openai import OpenAI
-import json
 
 # ── 1. Usuń klucz środowiskowy, jeśli był ustawiony globalnie
 os.environ.pop("OPENAI_API_KEY", None)
