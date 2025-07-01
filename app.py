@@ -12,6 +12,10 @@ from openai import OpenAI
 from pycaret.regression import load_model, predict_model  
 import requests, textwrap
 from typing import Optional
+from langfuse import Langfuse
+from langfuse.decorators import observe
+from langfuse.openai import OpenAI
+import json
 
 # ── 1. Usuń klucz środowiskowy, jeśli był ustawiony globalnie
 os.environ.pop("OPENAI_API_KEY", None)
@@ -45,7 +49,17 @@ if not valid_key(st.session_state.openai_api_key):
                 st.error("❌ To nie wygląda na poprawny klucz OpenAI.")
     st.stop()   # ⟵ zatrzymujemy dalsze ładowanie aplikacji
 
-# ── 5. Zainicjuj klienta – od tego miejsca klucz jest poprawny
+# ── 5. Zainicjuj klienta Langfuse i OpenaAI – od tego miejsca klucz jest poprawny
+
+LANGFUSE_SECRET_KEY=os.getenv("secret_key")
+LANGFUSE_PUBLIC_KEY=os.getenv("public_key")
+LANGFUSE_HOST=os.getenv("host")
+
+langfuse = Langfuse(
+    secret_key=LANGFUSE_SECRET_KEY,
+    public_key=LANGFUSE_PUBLIC_KEY,
+    host=LANGFUSE_HOST
+)
 openai_client = OpenAI(api_key=st.session_state.openai_api_key)
 
 # pobieranie pozostałych kluczy
@@ -415,134 +429,182 @@ def trim_to_last_full_sentence(text: str) -> str:
     else:
         return text[:last_dot_index+1].strip()
 
+# --------------------------------------------------------------
+# Pomocnicza funkcja: generowanie opisu sytuacji kraju + trace
+# --------------------------------------------------------------
+def get_wiki_intro_pl(country_pl: str, chars: int = 1500) -> Optional[str]:
+    url = "https://pl.wikipedia.org/w/api.php"
+    params = {
+        "action": "query",
+        "prop": "extracts",
+        "exintro": True,
+        "explaintext": True,
+        "format": "json",
+        "titles": country_pl,
+    }
+    resp = requests.get(url, params=params, timeout=10).json()
+    pages = resp["query"]["pages"]
+    extract = next(iter(pages.values())).get("extract")
+    if not extract:
+        return None
+    clean = "\n".join(line for line in extract.splitlines() if not line.startswith("==")).strip()
+    return textwrap.shorten(clean, width=chars, placeholder="…")
+
+def describe_country_with_trace(country_pl: str) -> str:
+    """Zwraca opis (2 zdania) + zapisuje pełny trace w Langfuse."""
+    wiki_snippet = get_wiki_intro_pl(country_pl)
+
+    if wiki_snippet is None:
+        user_messages = [{
+            "role": "user",
+            "content": (
+                f"Napisz w maksymalnie 2 zdaniach po polsku aktualną "
+                f"(połowa roku 2025) sytuację polityczną i gospodarczą w kraju {country_pl}."
+            )
+        }]
+    else:
+        user_messages = [{
+            "role": "user",
+            "content": (
+                f"Poniżej masz fragment aktualnego artykułu z polskiej Wikipedii "
+                f"o kraju {country_pl} (stan połowa 2025 r.). "
+                f"Na jego podstawie podsumuj w **maksymalnie 2 zdaniach** "
+                f"obecną sytuację polityczną i gospodarczą.\n\n{wiki_snippet}"
+            )
+        }]
+
+    system_msg = {"role": "system", "content": "Jesteś analitykiem ekonomicznym."}
+    messages = [system_msg] + user_messages
+
+    # ---------- Langfuse trace / span / generation ----------
+    trace = langfuse.trace(
+        name="generate_country_description",
+        input=messages,
+        metadata={"country": country_pl, "model": OPENAI_MODEL}
+    )
+
+    span = trace.span(name="openai-chat", input={"messages": messages})
+
+    generation = span.generation(
+        name="chat-completion",
+        model=OPENAI_MODEL,
+        input=messages
+    )
+
+    chat_completion = openai_client.chat.completions.create(
+        model=OPENAI_MODEL,
+        messages=messages,
+        max_tokens=200,
+        temperature=0.7,
+    )
+
+    resp_text = chat_completion.choices[0].message.content.strip()
+
+    # ---------- zakończenie span / generation ----------
+    generation.end(
+        output=chat_completion.choices,
+        usage={
+            "input": chat_completion.usage.prompt_tokens,
+            "output": chat_completion.usage.completion_tokens,
+            "total": chat_completion.usage.total_tokens,
+            "unit": "TOKENS"
+        }
+    )
+    span.end(output=resp_text)
+    trace.update(output={"description": resp_text})
+
+    return resp_text
+
+def classify_sentiment_with_trace(description: str) -> str:
+    """Klasyfikuje opis jako 'dobra' lub 'zla' i loguje w Langfuse."""
+    messages = [
+        {"role": "system", "content": (
+            "Klasyfikuj opis sytuacji kraju jako dokładnie jedno z dwóch słów: "
+            "'dobra' (pozytywna) lub 'zla' (negatywna). "
+            "Odpowiedz tylko jednym słowem, bez dodatkowych znaków, spacji czy odmian."
+        )},
+        {"role": "user", "content": description}
+    ]
+
+    trace = langfuse.trace(
+        name="sentiment_classification",
+        input=messages,
+        metadata={"model": OPENAI_MODEL}
+    )
+    generation = trace.generation(
+        name="chat-completion",
+        model=OPENAI_MODEL,
+        input=messages
+    )
+
+    chat_comp = openai_client.chat.completions.create(
+        model=OPENAI_MODEL,
+        messages=messages,
+        max_tokens=3,
+        temperature=0
+    )
+    sentiment = chat_comp.choices[0].message.content.strip().lower()
+
+    generation.end(output=chat_comp.choices)
+    trace.update(output={"sentiment": sentiment})
+
+    return sentiment
+
 # ---------- 10. PREDYKCJA ------------------------------------
 if st.button("Oblicz poziom szczęścia"):
     df_model = build_model_df()
 
     try:
         pred_df = predict_model(model, data=df_model)
-        if "prediction_label" in pred_df.columns:
-            pred = pred_df["prediction_label"].iloc[0]
-
-            # Automatyczne generowanie opisu bieżącej sytuacji przez OpenAI (źródło: Wikipedia)
-            try:
-                def get_wiki_intro_pl(country_pl: str, chars: int = 1500) -> Optional[str]:
-                    """
-                    Zwraca 1-2 pierwsze akapity artykułu w polskiej Wikipedii
-                    przycięte do ~chars znaków. Gdy brak artykułu - None.
-                    """
-                    url = "https://pl.wikipedia.org/w/api.php"
-                    params = {
-                        "action": "query",
-                        "prop": "extracts",
-                        "exintro": True,
-                        "explaintext": True,
-                        "format": "json",
-                        "titles": country_pl,
-                    }
-                    resp = requests.get(url, params=params, timeout=10).json()
-                    pages = resp["query"]["pages"]
-                    extract = next(iter(pages.values())).get("extract")
-                    if not extract:
-                        return None
-                    # usuwamy nagłówki sekcji i ograniczamy długość
-                    clean = "\n".join(
-                        line for line in extract.splitlines() if not line.startswith("==")
-                    ).strip()
-                    return textwrap.shorten(clean, width=chars, placeholder="…")
-
-                # ---------------------------------------------
-                country_pl = selected_country_pl               # z Twojego selectboxa
-                wiki_snippet = get_wiki_intro_pl(country_pl)
-
-                if wiki_snippet is None:
-                    st.warning("Nie znaleziono artykułu w polskiej Wikipedii - używam starego promptu.")
-                    generation_prompt = (
-                        f"Napisz w maksymalnie 2 zdaniach po polsku aktualną "
-                        f"(połowa roku 2025) sytuację polityczną i gospodarczą w kraju {country_pl}."
-                    )
-                    user_messages = [{"role": "user", "content": generation_prompt}]
-                else:
-                    user_messages = [
-                        {
-                            "role": "user",
-                            "content": (
-                                f"Poniżej masz fragment aktualnego artykułu z polskiej Wikipedii "
-                                f"o kraju {country_pl} (stan połowa 2025 r.). "
-                                f"Na jego podstawie podsumuj w **maksymalnie 2 zdaniach** "
-                                f"obecną sytuację polityczną i gospodarczą.\n\n"
-                                f"{wiki_snippet}"
-                            ),
-                        }
-                    ]
-
-                response = openai_client.chat.completions.create(
-                    model=OPENAI_MODEL,
-                    messages=[{"role": "system", "content": "Jesteś analitykiem ekonomicznym."}] + user_messages,
-                    max_tokens=200,
-                    temperature=0.7,
-                )
-                description_polish = response.choices[0].message.content.strip()
-                st.info(f"📰 Aktualna sytuacja w państwie {selected_country_pl}:  \n\n{description_polish}")
-            except Exception as e:
-                description_polish = ""
-                st.warning(f"⚠️ Nie udało się wygenerować opisu: {e}")
-
-            # Ocena wygenerowanego opisu i korekta predykcji
-            adjusted_pred = pred
-            try:
-                if description_polish:
-                    response = openai_client.chat.completions.create(
-                        model=OPENAI_MODEL,
-                        messages=[
-                            {"role": "system", "content": (
-                                "Klasyfikuj opis sytuacji kraju jako dokładnie jedno z dwóch słów: "
-                                "'dobra' (pozytywna) lub 'zla' (negatywna). "
-                                "Odpowiedz tylko jednym słowem, bez dodatkowych znaków, spacji czy odmian."
-                            )},
-                            {"role": "user", "content": description_polish}
-                        ],
-                        max_tokens=3,
-                        temperature=0
-                    )
-                    sentiment = response.choices[0].message.content.strip().lower()
-
-                    # Prosta normalizacja i walidacja
-                    if "dobra" in sentiment:
-                        adjusted_pred = pred + 1
-                    elif "zla" in sentiment or "zła" in sentiment:
-                        adjusted_pred = pred - 1
-                    else:
-                        st.warning(f"⚠️ Nieoczekiwany wynik sentymentu: '{sentiment}' — nie zmieniam predykcji.")
-            except Exception as e:
-                st.warning(f"⚠️ Nie udało się ocenić opisu: {e}")
-
-            pred = adjusted_pred
-
-            st.success(f"🎉 Prognozowany poziom szczęścia na rok {YEAR}")
-            st.header(f"{pred:.3f}")
-        else:
+        if "prediction_label" not in pred_df.columns:
             st.error("❌ Nie znaleziono kolumny z predykcją.")
+            st.stop()
+
+        pred = pred_df["prediction_label"].iloc[0]
+
+        # --- opis kraju (trace zapisany) ---
+        try:
+            description_polish = describe_country_with_trace(selected_country_pl)
+            st.info(f"📰 Aktualna sytuacja w państwie {selected_country_pl}:  \n\n{description_polish}")
+        except Exception as e:
+            description_polish = ""
+            st.warning(f"⚠️ Nie udało się wygenerować opisu: {e}")
+
+        # --- ocena sentymentu (trace zapisany) ---
+        adjusted_pred = pred
+        try:
+            if description_polish:
+                sentiment = classify_sentiment_with_trace(description_polish)
+
+                if "dobra" in sentiment:
+                    adjusted_pred = pred + 1
+                elif "zla" in sentiment or "zła" in sentiment:
+                    adjusted_pred = pred - 1
+                else:
+                    st.warning(f"⚠️ Nieoczekiwany wynik sentymentu: '{sentiment}' — nie zmieniam predykcji.")
+        except Exception as e:
+            st.warning(f"⚠️ Nie udało się ocenić opisu: {e}")
+
+        pred = adjusted_pred
+
+        st.success(f"🎉 Prognozowany poziom szczęścia na rok {YEAR}")
+        st.header(f"{pred:.3f}")
+
     except Exception as e:
         st.error(f"❌ Błąd podczas predykcji: {e}")
 
+    # ---------- interpretacja, emoji i tabela ----------
     if pred < 3:
-        emoji = "😢"
-        desc = "Bardzo niski"
+        emoji, desc = "😢", "Bardzo niski"
     elif pred < 6:
-        emoji = "😐"
-        desc = "Umiarkowany"
+        emoji, desc = "😐", "Umiarkowany"
     elif pred < 8:
-        emoji = "😊"
-        desc = "Wysoki"
+        emoji, desc = "😊", "Wysoki"
     else:
-        emoji = "😁"
-        desc = "Bardzo wysoki"
+        emoji, desc = "😁", "Bardzo wysoki"
 
-    # Wyświetlenie buźki i opisu
     st.markdown(f"### {emoji} {desc}")
 
-    # --- TABELKA INTERPRETACYJNA -------------------------------
     happiness_scale = pd.DataFrame({
         "Zakres wyniku": ["1-3", "3-6", "6-8", "8-10"],
         "Poziom szczęścia": [
@@ -552,11 +614,9 @@ if st.button("Oblicz poziom szczęścia"):
             "Bardzo wysoki - społeczeństwo bardzo zadowolone"
         ]
     })
-
     st.markdown("#### 🧭 Interpretacja wyniku")
     happiness_scale.index = [""] * len(happiness_scale)
     st.table(happiness_scale)
 
-    # KONIEC 
-
+    # KONIEC
 
