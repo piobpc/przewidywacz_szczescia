@@ -116,12 +116,31 @@ COLUMN_MAP: Dict[str, str] = {
 #
 
 # ---------- 4. INTERFEJS -------------------------------------
-st.markdown(
-    """
-    <h2 style='text-align: center;'>🐯 Przewidywacz poziomu szczęścia</h2>
-    """,
-    unsafe_allow_html=True
-)
+# DODANIE OBRAZKA PO LEWEJ STRONIE
+# URL DO OBRAZKA
+IMAGE = "https://images.pexels.com/photos/8542559/pexels-photo-8542559.jpeg"
+col1, col2 = st.columns([1, 5])
+with col1:
+    st.image(IMAGE, width=80)  # obrazek
+
+with col2:
+    st.markdown(
+        """
+        <h2 style='text-align: center;'> Przewidywacz poziomu szczęścia</h2>
+        """,
+        unsafe_allow_html=True
+    )
+
+# NOWA FUNKCJONALNOŚĆ - Mały przycisk "O twórcy"
+if "show_author" not in st.session_state:
+    st.session_state.show_author = False
+
+if st.button("O twórcy"):
+    st.session_state.show_author = not st.session_state.show_author
+
+if st.session_state.show_author:
+    st.markdown("Autor: Piotr :tiger:")
+    st.markdown("Github: [LINK](https://github.com/piobpc/)")
 
 with st.expander("ℹ️ Jak korzystać?", expanded=False):
     st.markdown(
